@@ -2,99 +2,69 @@ package main
 
 import (
 	"flag"
-	"io"
 	"log"
-	"net"
 	"net/http"
-	"strings"
+
+	"github.com/go-httpproxy/httpproxy"
 )
 
-// Hop-by-hop headers. These are removed when sent to the backend.
-// http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html
-var hopHeaders = []string{
-	"Connection",
-	"Keep-Alive",
-	"Proxy-Authenticate",
-	"Proxy-Authorization",
-	"Te", // canonicalized version of "TE"
-	"Trailers",
-	"Transfer-Encoding",
-	"Upgrade",
+
+
+
+func OnError(ctx *httpproxy.Context, where string,
+	err *httpproxy.Error, opErr error) {
+	// Log errors.
+	log.Printf("ERR: %s: %s [%s]", where, err, opErr)
 }
 
-func copyHeader(dst, src http.Header) {
-	for k, vv := range src {
-		for _, v := range vv {
-			dst.Add(k, v)
-		}
+func OnAccept(ctx *httpproxy.Context, w http.ResponseWriter,
+	r *http.Request) bool {
+	// Handle local request has path "/info"
+	if r.Method == "GET" && !r.URL.IsAbs() && r.URL.Path == "/info" {
+		w.Write([]byte("This is go-httpproxy."))
+		return true
 	}
+	return false
 }
 
-func delHopHeaders(header http.Header) {
-	for _, h := range hopHeaders {
-		header.Del(h)
+func OnAuth(ctx *httpproxy.Context, authType string, user string, pass string) bool {
+	// Auth test user.
+	if user == "test" && pass == "1234" {
+		return true
 	}
+	return false
 }
 
-func appendHostToXForwardHeader(header http.Header, host string) {
-	// If we aren't the first proxy retain prior
-	// X-Forwarded-For information as a comma+space
-	// separated list and fold multiple headers into one.
-	if prior, ok := header["X-Forwarded-For"]; ok {
-		host = strings.Join(prior, ", ") + ", " + host
-	}
-	header.Set("X-Forwarded-For", host)
+func OnRequest(ctx *httpproxy.Context, req *http.Request) (
+	resp *http.Response) {
+	// Log proxying requests.
+	log.Printf("INFO: Proxy: %s %s", req.Method, req.URL.String())
+	return
 }
 
-type proxy struct {
-}
-
-func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
-	log.Println(req.RemoteAddr, " ", req.Method, " ", req.URL)
-
-	if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
-		msg := "unsupported protocal scheme "+req.URL.Scheme
-		http.Error(wr, msg, http.StatusBadRequest)
-		log.Println(msg)
-		return
-	}
-
-	client := &http.Client{}
-
-	//http: Request.RequestURI can't be set in client requests.
-	//http://golang.org/src/pkg/net/http/client.go
-	req.RequestURI = ""
-
-	delHopHeaders(req.Header)
-
-	if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
-		appendHostToXForwardHeader(req.Header, clientIP)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		http.Error(wr, "Server Error", http.StatusInternalServerError)
-		log.Fatal("ServeHTTP:", err)
-	}
-	defer resp.Body.Close()
-
-	log.Println(req.RemoteAddr, " ", resp.Status)
-
-	delHopHeaders(resp.Header)
-
-	copyHeader(wr.Header(), resp.Header)
-	wr.WriteHeader(resp.StatusCode)
-	io.Copy(wr, resp.Body)
+func OnResponse(ctx *httpproxy.Context, req *http.Request,
+	resp *http.Response) {
+	// Add header "Via: go-httpproxy".
+	resp.Header.Add("Via", "go-httpproxy")
 }
 
 func main() {
-	var addr = flag.String("addr", "127.0.0.1:8080", "The addr of the application.")
-	flag.Parse()
-	
-	handler := &proxy{}
-	
+    var addr = flag.String("addr", "127.0.0.1:8080", "The addr of the application.")
+    flag.Parse()
+	// Create a new proxy with default certificate pair.
+	prx, _ := httpproxy.NewProxy()
+
+	// Set handlers.
+	prx.OnError = OnError
+	prx.OnAccept = OnAccept
+	prx.OnAuth = OnAuth
+	prx.OnRequest = OnRequest
+	prx.OnResponse = OnResponse
 	log.Println("Starting proxy server on", *addr)
-	if err := http.ListenAndServe(*addr, handler); err != nil {
-		log.Fatal("ListenAndServe:", err)
-	}
+
+	// Listen...
+	if err := http.ListenAndServe(*addr, prx);  err != nil {
+        log.Fatal("ListenAndServe:", err)
+    }
 }
+
